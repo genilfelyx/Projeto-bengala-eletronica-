@@ -1,364 +1,399 @@
-
 #include <Arduino.h>
 #include <Servo.h>
 #include <Wire.h>
 #include <math.h>
 
-// Sensores ultrassonicos
-const int trig1 = 7;
-const int echo1 = 6;
+// Pinagem do Arduino Nano
+const byte TRIG_FRENTE = 2;
+const byte ECHO_FRENTE = 3;
+const byte TRIG_SUPERIOR = 4;
+const byte ECHO_SUPERIOR = 5;
+const byte TRIG_INFERIOR = 6;
+const byte ECHO_INFERIOR = 7;
+const byte PINO_BOTAO = 8;
+const byte PINO_SERVO = 9;
+const byte PINO_BUZZER = 10;
 
-const int trig2 = 4;
-const int echo2 = 5;
+// Limites das leituras e dos alertas, em centimetros
+const float LIMITE_ALERTA = 150.0f;
+const float LIMITE_MEDIO = 100.0f;
+const float LIMITE_PROXIMO = 50.0f;
+const float DIST_MINIMA = 2.0f;
+const float DIST_MAXIMA = 350.0f;
 
-const int trig3 = 2;
-const int echo3 = 3;
+// Periodos de atualizacao
+const unsigned long INTERVALO_SENSORES_MS = 150;
+const unsigned long INTERVALO_ENTRE_SENSORES_MS = 60;
+const unsigned long INTERVALO_MPU_MS = 100;
+const unsigned long INTERVALO_STATUS_MS = 500;
+const unsigned long TEMPO_CALIBRACAO_MS = 3000;
+const unsigned long INTERVALO_AMOSTRA_MS = 20;
+const unsigned long DEBOUNCE_MS = 40;
 
-// Limites de deteccao
-const float distanciaChao = 30.0;
-const float diferencaBuraco = 15.0;
-const float limiteObstaculo = 40.0;
+// Configuracao do MPU-6050
+const byte MPU_ADDR = 0x68;
+bool mpuDisponivel = false;
+bool calibracaoConcluida = false;
+float anguloZero = 0.0f;
+float anguloAtual = 0.0f;
 
-// MPU6050
-const int enderecoMPU = 0x68;
-const float anguloMinBengala = 10.0;
-const float anguloMaxBengala = 60.0;
-bool mpuConectado = false;
+// Distancias atuais; -1 representa uma leitura sem eco valido
+float distFrente = -1.0f;
+float distSuperior = -1.0f;
+float distInferior = -1.0f;
 
-// Buzzer, chave e servo
-const int buzzer = 8;
-const int botao = A3;
-const int pinoServo = 9;
+unsigned long ultimoCicloSensores = 0;
+unsigned long ultimaLeituraMPU = 0;
+unsigned long ultimoStatus = 0;
 
-const int servPause = 90;
-const int servClique = 65;
+// O botao usa INPUT_PULLUP: LOW significa pressionado
+bool buzzerAtivo = true;
+bool leituraAnterior = HIGH;
+bool estadoEstavel = HIGH;
+unsigned long ultimaMudancaBotao = 0;
 
-Servo servo;
+// Estado do alerta sonoro intermitente
+bool buzzerLigado = false;
+unsigned long inicioFaseBuzzer = 0;
+unsigned long duracaoFaseBuzzer = 0;
 
-// Controle da exibicao serial
-int ultimoAlerta = -1;
-bool ultimoEstadoBuraco = false;
-unsigned long ultimaImpressao = 0;
-const unsigned long intervaloSerial = 500;
+// Estado do mecanismo tatil
+Servo servoTatil;
+const int SERVO_REPOUSO = 90;
+const int SERVO_A = 82;
+const int SERVO_B = 98;
+const unsigned long DURACAO_PULSO_SERVO_MS = 130;
+bool servoEmPulso = false;
+bool proximaPosicao = false;
+unsigned long inicioPulsoServo = 0;
+unsigned long ultimoPulsoServo = 0;
 
-// Inicializa o MPU6050
-void iniciarMPU() {
-  Wire.begin();
-
-  Wire.beginTransmission(enderecoMPU);
-  Wire.write(0x6B);
-  Wire.write(0x00);
-
-  mpuConectado = (Wire.endTransmission() == 0);
+// Comunicacao com o MPU-6050
+bool escreverMPU(byte reg, byte valor) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.write(valor);
+  return Wire.endTransmission() == 0;
 }
 
-// Le os dados do acelerometro
-bool lerMPU(float &ax, float &ay, float &az) {
-  if (!mpuConectado) {
+int16_t lerInt16() {
+  const uint16_t alto = static_cast<uint16_t>(Wire.read());
+  const uint16_t baixo = static_cast<uint16_t>(Wire.read());
+  return static_cast<int16_t>((alto << 8) | baixo);
+}
+
+bool iniciarMPU() {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x75);  // WHO_AM_I
+
+  if (Wire.endTransmission(false) != 0 ||
+      Wire.requestFrom(MPU_ADDR, static_cast<byte>(1)) != 1) {
     return false;
   }
 
-  Wire.beginTransmission(enderecoMPU);
-  Wire.write(0x3B);
-
-  if (Wire.endTransmission(false) != 0) {
+  if (Wire.read() != 0x68) {
     return false;
   }
 
-  Wire.requestFrom(enderecoMPU, 6, true);
+  // Acorda o sensor e seleciona a faixa de aceleracao de +/- 2 g.
+  return escreverMPU(0x6B, 0x00) && escreverMPU(0x1C, 0x00);
+}
 
-  if (Wire.available() < 6) {
+bool lerAngulo(float &angulo) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3B);  // Registradores iniciais do acelerometro
+
+  if (Wire.endTransmission(false) != 0 ||
+      Wire.requestFrom(MPU_ADDR, static_cast<byte>(6)) != 6) {
     return false;
   }
 
-  int16_t rawAX = Wire.read() << 8 | Wire.read();
-  int16_t rawAY = Wire.read() << 8 | Wire.read();
-  int16_t rawAZ = Wire.read() << 8 | Wire.read();
+  const int16_t axRaw = lerInt16();
+  const int16_t ayRaw = lerInt16();
+  const int16_t azRaw = lerInt16();
 
-  ax = rawAX / 16384.0;
-  ay = rawAY / 16384.0;
-  az = rawAZ / 16384.0;
+  const float ax = axRaw / 16384.0f;
+  const float ay = ayRaw / 16384.0f;
+  const float az = azRaw / 16384.0f;
 
+  angulo = atan2(ax, sqrt(ay * ay + az * az)) * 180.0f / PI;
   return true;
 }
 
-// Verifica se o sistema esta desligado
-bool sistemaDesligado() {
-  return digitalRead(botao) == HIGH;
+void calibrarMPU() {
+  Serial.println(F("Calibrando MPU: mantenha a bengala imovel."));
+
+  const unsigned long inicio = millis();
+  unsigned long ultimaAmostra = inicio;
+  float somaAngulos = 0.0f;
+  unsigned int quantidadeAmostras = 0;
+
+  while (millis() - inicio < TEMPO_CALIBRACAO_MS) {
+    const unsigned long agora = millis();
+
+    if (agora - ultimaAmostra >= INTERVALO_AMOSTRA_MS) {
+      ultimaAmostra = agora;
+
+      float angulo;
+      if (lerAngulo(angulo)) {
+        somaAngulos += angulo;
+        quantidadeAmostras++;
+      }
+    }
+
+    delay(1);
+  }
+
+  if (quantidadeAmostras == 0) {
+    Serial.println(F("ERRO: nao foi possivel calibrar o MPU."));
+    return;
+  }
+
+  anguloZero = somaAngulos / quantidadeAmostras;
+  calibracaoConcluida = true;
+
+  Serial.print(F("Referencia angular: "));
+  Serial.println(anguloZero, 2);
+  Serial.println(F("Calibracao concluida."));
 }
 
-// Mede a distancia de um sensor ultrassonico
-float medirDistancia(int trig, int echo) {
+// Leitura dos sensores ultrassonicos
+float lerDistancia(byte trig, byte echo) {
   digitalWrite(trig, LOW);
-  delayMicroseconds(2);
-
+  delayMicroseconds(3);
   digitalWrite(trig, HIGH);
   delayMicroseconds(10);
   digitalWrite(trig, LOW);
 
-  unsigned long duracao = pulseIn(echo, HIGH, 30000);
-
+  const unsigned long duracao = pulseIn(echo, HIGH, 24000UL);
   if (duracao == 0) {
-    return -1;
+    return -1.0f;
   }
 
-  return duracao * 0.0343 / 2.0;
+  const float distancia = duracao * 0.0343f / 2.0f;
+  if (distancia < DIST_MINIMA || distancia > DIST_MAXIMA) {
+    return -1.0f;
+  }
+
+  return distancia;
 }
 
-// Aciona o buzzer e o servo
-void tocarAlerta(int frequencia, int duracao, int pausa) {
-  if (sistemaDesligado()) {
+void atualizarDistancias() {
+  distFrente = lerDistancia(TRIG_FRENTE, ECHO_FRENTE);
+  delay(INTERVALO_ENTRE_SENSORES_MS);
+
+  distSuperior = lerDistancia(TRIG_SUPERIOR, ECHO_SUPERIOR);
+  delay(INTERVALO_ENTRE_SENSORES_MS);
+
+  distInferior = lerDistancia(TRIG_INFERIOR, ECHO_INFERIOR);
+  ultimoCicloSensores = millis();
+}
+
+float menorDistancia() {
+  float menor = -1.0f;
+
+  if (distFrente > 0.0f && (menor < 0.0f || distFrente < menor)) {
+    menor = distFrente;
+  }
+  if (distSuperior > 0.0f && (menor < 0.0f || distSuperior < menor)) {
+    menor = distSuperior;
+  }
+  if (distInferior > 0.0f && (menor < 0.0f || distInferior < menor)) {
+    menor = distInferior;
+  }
+
+  return menor;
+}
+
+unsigned long intervaloAlerta(float distancia) {
+  if (distancia < 0.0f || distancia > LIMITE_ALERTA) {
+    return 0;
+  }
+  if (distancia <= LIMITE_PROXIMO) {
+    return 180;
+  }
+  if (distancia <= LIMITE_MEDIO) {
+    return 350;
+  }
+
+  return 700;
+}
+
+// Controles de entrada e saida
+void atualizarBotao() {
+  const bool leitura = digitalRead(PINO_BOTAO);
+  const unsigned long agora = millis();
+
+  if (leitura != leituraAnterior) {
+    ultimaMudancaBotao = agora;
+    leituraAnterior = leitura;
+  }
+
+  if (agora - ultimaMudancaBotao < DEBOUNCE_MS || leitura == estadoEstavel) {
     return;
   }
 
-  servo.write(servClique);
-  tone(buzzer, frequencia);
-  delay(duracao);
-  noTone(buzzer);
-  servo.write(servPause);
-  delay(pausa);
+  estadoEstavel = leitura;
+  if (estadoEstavel != LOW) {
+    return;
+  }
+
+  buzzerAtivo = !buzzerAtivo;
+  Serial.print(F("Buzzer: "));
+  Serial.println(buzzerAtivo ? F("ATIVADO") : F("DESATIVADO"));
+
+  if (!buzzerAtivo) {
+    digitalWrite(PINO_BUZZER, LOW);
+    buzzerLigado = false;
+  }
 }
 
-// Executa os sons de alerta
-void alertaBuzzer(bool buraco) {
-  if (buraco) {
-    tocarAlerta(2500, 250, 100);
-    tocarAlerta(2000, 250, 100);
+void atualizarBuzzer() {
+  const unsigned long intervalo = intervaloAlerta(menorDistancia());
+  const unsigned long agora = millis();
+
+  if (!buzzerAtivo || intervalo == 0) {
+    digitalWrite(PINO_BUZZER, LOW);
+    buzzerLigado = false;
+    return;
+  }
+
+  if (agora - inicioFaseBuzzer < duracaoFaseBuzzer) {
+    return;
+  }
+
+  inicioFaseBuzzer = agora;
+  buzzerLigado = !buzzerLigado;
+
+  const unsigned long metade = intervalo / 2;
+  duracaoFaseBuzzer = buzzerLigado ? metade : intervalo - metade;
+  digitalWrite(PINO_BUZZER, buzzerLigado ? HIGH : LOW);
+}
+
+void atualizarServo() {
+  const unsigned long intervalo = intervaloAlerta(menorDistancia());
+  const unsigned long agora = millis();
+
+  if (intervalo == 0) {
+    if (servoEmPulso) {
+      servoTatil.write(SERVO_REPOUSO);
+      servoEmPulso = false;
+    }
+    return;
+  }
+
+  if (servoEmPulso &&
+      agora - inicioPulsoServo >= DURACAO_PULSO_SERVO_MS) {
+    servoTatil.write(SERVO_REPOUSO);
+    servoEmPulso = false;
+  }
+
+  if (!servoEmPulso && agora - ultimoPulsoServo >= intervalo) {
+    proximaPosicao = !proximaPosicao;
+    servoTatil.write(proximaPosicao ? SERVO_A : SERVO_B);
+    servoEmPulso = true;
+    inicioPulsoServo = agora;
+    ultimoPulsoServo = agora;
+  }
+}
+
+// Exibicao de diagnostico
+void imprimirDistancia(const __FlashStringHelper *nome, float distancia) {
+  Serial.print(nome);
+  if (distancia < 0.0f) {
+    Serial.print(F("sem eco"));
   } else {
-    tocarAlerta(2000, 200, 80);
-    tocarAlerta(2500, 200, 80);
+    Serial.print(distancia, 1);
+    Serial.print(F(" cm"));
   }
 }
 
-// Coloca os componentes em estado de repouso
-void desligarSistema() {
-  noTone(buzzer);
+void imprimirStatus() {
+  imprimirDistancia(F("Frente: "), distFrente);
+  Serial.print(F(" | Superior: "));
+  imprimirDistancia(F(""), distSuperior);
+  Serial.print(F(" | Inferior: "));
+  imprimirDistancia(F(""), distInferior);
 
-  digitalWrite(trig1, LOW);
-  digitalWrite(trig2, LOW);
-  digitalWrite(trig3, LOW);
+  Serial.print(F(" | Inclinacao relativa: "));
+  if (mpuDisponivel && calibracaoConcluida) {
+    Serial.print(anguloAtual - anguloZero, 1);
+    Serial.print(F(" graus"));
+  } else {
+    Serial.print(F("indisponivel"));
+  }
 
-  servo.write(servPause);
+  const float distancia = menorDistancia();
+  Serial.print(F(" | Alerta: "));
+  if (distancia < 0.0f) {
+    Serial.println(F("sem leitura valida"));
+  } else if (distancia > LIMITE_ALERTA) {
+    Serial.println(F("sem deteccao no limite"));
+  } else if (distancia <= LIMITE_PROXIMO) {
+    Serial.println(F("PROXIMO"));
+  } else if (distancia <= LIMITE_MEDIO) {
+    Serial.println(F("MEDIO"));
+  } else {
+    Serial.println(F("ATENCAO"));
+  }
 }
 
-// Inicializa os sensores ultrassonicos
 void iniciarSensores() {
-  pinMode(trig1, OUTPUT);
-  pinMode(echo1, INPUT);
+  pinMode(TRIG_FRENTE, OUTPUT);
+  pinMode(ECHO_FRENTE, INPUT);
+  pinMode(TRIG_SUPERIOR, OUTPUT);
+  pinMode(ECHO_SUPERIOR, INPUT);
+  pinMode(TRIG_INFERIOR, OUTPUT);
+  pinMode(ECHO_INFERIOR, INPUT);
 
-  pinMode(trig2, OUTPUT);
-  pinMode(echo2, INPUT);
-
-  pinMode(trig3, OUTPUT);
-  pinMode(echo3, INPUT);
-}
-
-// Inicializa buzzer e chave
-void iniciarBuzzerEBotao() {
-  pinMode(buzzer, OUTPUT);
-  pinMode(botao, INPUT_PULLUP);
-}
-
-// Inicializa o servo motor
-void iniciarServo() {
-  servo.attach(pinoServo);
-  servo.write(servPause);
-}
-
-// Detecta obstaculos ou possivel buraco
-int detectarAlerta(
-  float distancia1,
-  float distancia2,
-  float distancia3,
-  bool leituraMPUValida,
-  bool inclinacaoAdequada,
-  bool &buraco
-) {
-  buraco = false;
-
-  if (
-    distancia1 >= 0 &&
-    distancia1 > distanciaChao + diferencaBuraco &&
-    leituraMPUValida &&
-    inclinacaoAdequada
-  ) {
-    buraco = true;
-    return 1;
-  }
-
-  if (distancia1 >= 0 && distancia1 < limiteObstaculo) {
-    return 1;
-  }
-
-  if (distancia2 >= 0 && distancia2 < limiteObstaculo) {
-    return 2;
-  }
-
-  if (distancia3 >= 0 && distancia3 < limiteObstaculo) {
-    return 3;
-  }
-
-  return 0;
+  digitalWrite(TRIG_FRENTE, LOW);
+  digitalWrite(TRIG_SUPERIOR, LOW);
+  digitalWrite(TRIG_INFERIOR, LOW);
 }
 
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(115200);
 
   iniciarSensores();
-  iniciarBuzzerEBotao();
-  iniciarServo();
-  iniciarMPU();
+  pinMode(PINO_BOTAO, INPUT_PULLUP);
+  pinMode(PINO_BUZZER, OUTPUT);
+  digitalWrite(PINO_BUZZER, LOW);
 
-  Serial.println("=== BENGALA ELETRONICA ===");
+  servoTatil.attach(PINO_SERVO);
+  servoTatil.write(SERVO_REPOUSO);
 
-  if (mpuConectado) {
-    Serial.println("MPU6050: conectado");
+  Wire.begin();
+  mpuDisponivel = iniciarMPU();
+
+  Serial.println(F("=== BENGALA ELETRONICA EXPERIMENTAL ==="));
+  if (mpuDisponivel) {
+    Serial.println(F("MPU-6050 conectado."));
+    calibrarMPU();
   } else {
-    Serial.println("ERRO: MPU6050 nao encontrado!");
+    Serial.println(F("MPU-6050 nao encontrado; inclinacao indisponivel."));
   }
-
-  Serial.println("Sensores ultrassonicos: iniciados");
-  Serial.println("Servo motor: iniciado");
-  Serial.println("Sistema iniciado.");
-  Serial.println("--------------------------");
+  Serial.println(F("Sensores e alertas iniciados."));
 }
 
 void loop() {
-  if (sistemaDesligado()) {
-    desligarSistema();
+  atualizarBotao();
 
-    if (ultimoAlerta != -1) {
-      Serial.println("Sistema desligado.");
-      ultimoAlerta = -1;
-      ultimoEstadoBuraco = false;
-    }
-
-    delay(100);
-    return;
+  const unsigned long agora = millis();
+  if (agora - ultimoCicloSensores >= INTERVALO_SENSORES_MS) {
+    atualizarDistancias();
   }
 
-  float distancia1 = medirDistancia(trig1, echo1);
-  delay(50);
-
-  float distancia2 = medirDistancia(trig2, echo2);
-  delay(50);
-
-  float distancia3 = medirDistancia(trig3, echo3);
-  delay(50);
-
-  float ax = 0;
-  float ay = 0;
-  float az = 0;
-
-  float inclinacaoX = 0;
-  float inclinacaoY = 0;
-
-  bool leituraMPUValida = lerMPU(ax, ay, az);
-  bool inclinacaoAdequada = false;
-
-  if (leituraMPUValida) {
-    inclinacaoX = atan2(ay, az) * 180.0 / PI;
-
-    inclinacaoY =
-      atan2(-ax, sqrt(ay * ay + az * az)) * 180.0 / PI;
-
-    inclinacaoAdequada =
-      fabs(inclinacaoY) >= anguloMinBengala &&
-      fabs(inclinacaoY) <= anguloMaxBengala;
+  if (mpuDisponivel &&
+      millis() - ultimaLeituraMPU >= INTERVALO_MPU_MS) {
+    ultimaLeituraMPU = millis();
+    lerAngulo(anguloAtual);
   }
 
-  // Distancias e inclinacao: exibidas a cada 500 ms
-  if (millis() - ultimaImpressao >= intervaloSerial) {
-    ultimaImpressao = millis();
+  atualizarBuzzer();
+  atualizarServo();
 
-    Serial.print("S1: ");
-    if (distancia1 < 0) {
-      Serial.print("--");
-    } else {
-      Serial.print(distancia1, 1);
-    }
-
-    Serial.print(" cm | S2: ");
-    if (distancia2 < 0) {
-      Serial.print("--");
-    } else {
-      Serial.print(distancia2, 1);
-    }
-
-    Serial.print(" cm | S3: ");
-    if (distancia3 < 0) {
-      Serial.print("--");
-    } else {
-      Serial.print(distancia3, 1);
-    }
-
-    Serial.print(" cm | Inclinacao: ");
-    Serial.print(inclinacaoY, 1);
-    Serial.println(" graus");
+  if (millis() - ultimoStatus >= INTERVALO_STATUS_MS) {
+    ultimoStatus = millis();
+    imprimirStatus();
   }
-
-  bool buraco = false;
-
-  int sensorAlerta = detectarAlerta(
-    distancia1,
-    distancia2,
-    distancia3,
-    leituraMPUValida,
-    inclinacaoAdequada,
-    buraco
-  );
-
-  // Exibe uma mensagem quando o estado do alerta muda
-  bool estadoMudou =
-    sensorAlerta != ultimoAlerta ||
-    (sensorAlerta != 0 && buraco != ultimoEstadoBuraco);
-
-  if (estadoMudou) {
-    if (sensorAlerta == 0) {
-      Serial.println("Area livre.");
-    } else if (buraco) {
-      Serial.println("ALERTA: Possivel buraco!");
-      Serial.print("Sensor: 1 | Distancia: ");
-      Serial.print(distancia1, 1);
-      Serial.println(" cm");
-
-      Serial.print("Inclinacao: ");
-      Serial.print(inclinacaoY, 1);
-      Serial.println(" graus");
-    } else {
-      Serial.print("ALERTA: Obstaculo proximo!");
-      Serial.print(" Sensor: ");
-      Serial.print(sensorAlerta);
-      Serial.print(" | Distancia: ");
-
-      float distanciaAlerta = distancia1;
-
-      if (sensorAlerta == 2) {
-        distanciaAlerta = distancia2;
-      } else if (sensorAlerta == 3) {
-        distanciaAlerta = distancia3;
-      }
-
-      Serial.print(distanciaAlerta, 1);
-      Serial.println(" cm");
-    }
-
-    ultimoAlerta = sensorAlerta;
-    ultimoEstadoBuraco = buraco;
-  }
-
-  if (sensorAlerta != 0) {
-    alertaBuzzer(buraco);
-
-    if (sistemaDesligado()) {
-      desligarSistema();
-      ultimoAlerta = -1;
-      ultimoEstadoBuraco = false;
-    }
-  } else {
-    noTone(buzzer);
-    servo.write(servPause);
-  }
-
-  delay(20);
 }
